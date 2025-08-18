@@ -45,7 +45,7 @@ func (node *CommitNode) Items() []CommitNode {
 type Commit struct {
 	Hash      string
 	Tree      string
-	Parents   []*CommitNode
+	Parents   []*Commit
 	Author    Signature
 	Committer Signature
 	Message   string
@@ -58,12 +58,7 @@ type Signature struct {
 }
 
 func main() {
-	git := git.NewShellClient()
-	branch, err := git.GetCurrentBranch()
-	if err != nil {
-		fmt.Println("could not get current branch")
-	}
-	historyForBranch(branch)
+	git.GetHistoryFor("main")
 }
 
 func historyForBranch(branch string) {
@@ -140,6 +135,8 @@ func createCommit(hash string, cr io.Reader) (*CommitNode, error) {
 		val: Commit{Hash: hash},
 	}
 	for {
+		bs, _ := io.ReadAll(zlibR)
+		fmt.Println(string(bs))
 		line, err := br.ReadBytes('\n')
 		if err != nil && err != io.EOF {
 			return &CommitNode{}, err
@@ -157,7 +154,6 @@ func createCommit(hash string, cr io.Reader) (*CommitNode, error) {
 			if err != nil {
 				return &CommitNode{}, fmt.Errorf("error occurred while building out tree: %w", err)
 			}
-			head.val.Parents = append(head.val.Parents, parent)
 		case bytes.HasPrefix(line, authorLine):
 			//fmt.Println("Not bothering with author right now")
 		case bytes.HasPrefix(line, commiterLine):
