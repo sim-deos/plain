@@ -58,7 +58,19 @@ type Signature struct {
 }
 
 func main() {
-	git.GetHistoryFor("main")
+	graph, err := git.GetHistoryFor("walk")
+	if err != nil {
+		fmt.Println("git error: ", err.Error())
+	}
+
+	curr := graph.Head
+	for {
+		fmt.Printf("* %s | parents:%s\n", curr.Hash[:7], curr.Parents)
+		if curr.IsEnd() {
+			break
+		}
+		curr = graph.Commits[curr.Parents[0]]
+	}
 }
 
 func historyForBranch(branch string) {

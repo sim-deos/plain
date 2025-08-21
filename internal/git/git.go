@@ -6,25 +6,76 @@ import (
 	"compress/zlib"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
 var (
+	Megabyte = 100_000
+
 	ErrNotRepo = errors.New("not a git repository")
 )
 
+type BranchGraph struct {
+	Head    Commit
+	Commits map[string]Commit
+}
+
+type HeaderScanner struct {
+	br *bufio.Reader
+}
+
+type Header struct {
+	Kind string
+	Size int64
+}
+
+func NewHeaderScanner() *HeaderScanner {
+	return &HeaderScanner{br: bufio.NewReader(nil)}
+}
+
+func (hs *HeaderScanner) Reset(r io.Reader) {
+	hs.br.Reset(r)
+}
+
+// Scan parses the header from a git object and returns a reader primed to read the following git objects payload.
+func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
+	kind, err := hs.br.ReadString(' ')
+	if err != nil {
+		return Header{}, nil, err
+	}
+	kind = kind[:len(kind)-1]
+
+	sizeBytes, err := hs.br.ReadString('\x00')
+	if err != nil {
+		return Header{}, nil, err
+	}
+	sizeBytes = sizeBytes[:len(sizeBytes)-1]
+
+	size, err := strconv.Atoi(sizeBytes)
+	if err != nil {
+		return Header{}, nil, err
+	}
+
+	return Header{Kind: kind, Size: int64(size)}, &io.LimitedReader{R: hs.br, N: int64(size)}, nil
+}
+
+// creater a commit, put it in the commitgraph
 type Commit struct {
-	Hash      string
-	Tree      string
-	Parents   []*Commit
-	Author    Signature
-	Committer Signature
-	Message   string
+	Hash, Tree, Message string
+	Author, Committer   Signature
+	Parents             []string
+}
+
+func (c Commit) IsEnd() bool {
+	return len(c.Parents) == 0
 }
 
 type Signature struct {
@@ -79,45 +130,77 @@ func FindGitDir() (string, error) {
 	}
 }
 
-func GetHistoryFor(branch string) (Commit, error) {
+func GetHistoryFor(branch string) (BranchGraph, error) {
 	gitDir, err := FindGitDir()
 	if err != nil {
-		return Commit{}, err
+		return BranchGraph{}, err
 	}
 
 	branchPath := filepath.Join(gitDir, "refs", "heads", branch)
 	hs, err := os.ReadFile(branchPath)
 	if err != nil {
-		return Commit{}, fmt.Errorf("failed to retrieve head %w", err)
+		return BranchGraph{}, fmt.Errorf("failed to retrieve head %w", err)
 	}
 
-	head := string(hs[:len(hs)-1])
-	commitFilePath := filepath.Join(gitDir, "objects", head[:2], head[2:])
+	objectsDir := "objects"
 
-	cb, err := os.ReadFile(commitFilePath)
+	head := string(hs[:len(hs)-1])
+	headPath := filepath.Join(gitDir, objectsDir, head[:2], head[2:])
+
+	cb, err := os.ReadFile(headPath)
 	if err != nil {
-		return Commit{}, fmt.Errorf("failed to read %s: %w", commitFilePath, err)
+		return BranchGraph{}, fmt.Errorf("failed to read %s: %w", headPath, err)
 	}
 
 	cr := bytes.NewReader(cb)
 	zr, err := zlib.NewReader(cr)
 	if err != nil {
-		return Commit{}, fmt.Errorf("failed to create decompression reader: %w", err)
+		return BranchGraph{}, fmt.Errorf("failed to create decompression reader: %w", err)
 	}
 	rz := zr.(zlib.Resetter)
 	br := bufio.NewReader(zr)
 
-	// commit 236tree 20496db33bfb465582ec5b17ace02cb93598c5f3
-	// parent 68623a49d7063819550bff568c6e7d78d1c67597
-	// author Michael Tanami <tanamicodes@gmail.com> 1754691182 -0700
-	// committer Michael Tanami <tanamicodes@gmail.com> 1754691547 -0700
+	header, err := br.ReadSlice('\x00')
+	if err != nil {
+		return BranchGraph{}, err
+	}
+	sizeInBytes := header[slices.Index(header, ' ')+1 : len(header)-1]
 
-	// moved to DI
+	size, err := strconv.Atoi(string(sizeInBytes))
+	if err != nil {
+		return BranchGraph{}, err
+	}
 
-	stack := [][]byte{cb}
+	lim := io.LimitedReader{R: br, N: int64(size)}
+	pbr := bufio.NewReader(&lim)
+
+	headCommit, err := parseCommit(pbr)
+	headCommit.Hash = head
+	if err != nil {
+		return BranchGraph{}, fmt.Errorf("failed to parse head: %w", err)
+	}
+
+	graph := BranchGraph{Head: headCommit, Commits: map[string]Commit{head: headCommit}}
+	stack := slices.Clone(headCommit.Parents)
+
 	for len(stack) > 0 {
-		cb = stack[len(stack)-1]     // get last element
-		stack = stack[:len(stack)-1] // remove it (pop)
+		currCommitHash := stack[len(stack)-1] // get last element
+		stack = stack[:len(stack)-1]          // remove it (pop)
+
+		commitPath := filepath.Join(gitDir, objectsDir, currCommitHash[:2], currCommitHash[2:])
+
+		cb, err = os.ReadFile(commitPath)
+		if err != nil {
+			return BranchGraph{}, err
+		}
+
+		// reset readers
+		cr.Reset(cb)
+		rz.Reset(cr, nil)
+		br.Reset(zr)
+
+		bs, _ := io.ReadAll(br)
+		fmt.Println(string(bs))
 
 		// reset readers
 		cr.Reset(cb)
@@ -126,7 +209,7 @@ func GetHistoryFor(branch string) (Commit, error) {
 
 		kind, err := br.ReadString(' ')
 		if err != nil {
-			return Commit{}, err
+			return BranchGraph{}, err
 		}
 		kind = kind[:len(kind)-1]
 
@@ -134,11 +217,132 @@ func GetHistoryFor(branch string) (Commit, error) {
 			continue
 		}
 
-		header, _ := br.ReadBytes('\x00')
-		fmt.Println(string(header))
+		sizeBytes, err := br.ReadString('\x00')
+		if err != nil {
+			return BranchGraph{}, err
+		}
+		sizeBytes = sizeBytes[:len(sizeBytes)-1]
+
+		size, err := strconv.Atoi(sizeBytes)
+		if err != nil {
+			return BranchGraph{}, err
+		}
+
+		lim.R = br
+		lim.N = int64(size)
+		pbr.Reset(&lim)
+
+		commit, err := parseCommit(pbr)
+		if err != nil {
+			return BranchGraph{}, err
+		}
+		commit.Hash = currCommitHash
+
+		graph.Commits[currCommitHash] = commit
+		stack = append(stack, commit.Parents...)
 	}
 
-	return Commit{}, nil
+	return graph, nil
+}
+
+// It is assumed that the reader passed into this method is limited via a limited reader
+//
+// Example commit
+// tree 20496db33bfb465582ec5b17ace02cb93598c5f3
+// parent 68623a49d7063819550bff568c6e7d78d1c67597
+// author Michael Tanami <tanamicodes@gmail.com> 1754691182 -0700
+// committer Michael Tanami <tanamicodes@gmail.com> 1754691547 -0700
+func parseCommit(br *bufio.Reader) (Commit, error) {
+	commit := Commit{}
+	for {
+		key, err := br.ReadString(' ')
+		if err != nil {
+			if err == io.EOF {
+				return commit, nil
+			}
+			return Commit{}, err
+		}
+		key = key[:len(key)-1]
+
+		switch key {
+		case "tree":
+			val, err := br.ReadString('\n')
+			if err != nil {
+				return Commit{}, err
+			}
+			val = val[:len(val)-1]
+			commit.Tree = val
+		case "parent":
+			val, err := br.ReadString('\n')
+			if err != nil {
+				return Commit{}, err
+			}
+			val = val[:len(val)-1]
+			commit.Parents = append(commit.Parents, val)
+		case "author", "committer":
+			name, err := br.ReadString('<')
+			if err != nil {
+				return Commit{}, err
+			}
+			name = name[:len(name)-2]
+			email, err := br.ReadString(' ')
+			if err != nil {
+				return Commit{}, err
+			}
+			email = email[:len(email)-2]
+			unixTs, err := br.ReadString('\n')
+			if err != nil {
+				return Commit{}, err
+			}
+			timestamp, err := parseUnixWithOffset(unixTs[:len(unixTs)-1])
+			if err != nil {
+				return Commit{}, err
+			}
+			if key == "author" {
+				commit.Author = Signature{
+					Name:  name,
+					Email: email,
+					Time:  timestamp,
+				}
+			} else {
+				commit.Committer = Signature{
+					Name:  name,
+					Email: email,
+					Time:  timestamp,
+				}
+			}
+		case "\n":
+			return commit, nil
+		}
+	}
+}
+
+func parseUnixWithOffset(s string) (time.Time, error) {
+	parts := strings.Fields(s)
+	if len(parts) != 2 {
+		return time.Time{}, fmt.Errorf("invalid input format")
+	}
+
+	// Parse the UNIX timestamp
+	sec, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid unix timestamp: %w", err)
+	}
+
+	// Parse the timezone offset (+/-HHMM)
+	if len(parts[1]) != 5 {
+		return time.Time{}, fmt.Errorf("invalid offset format")
+	}
+	sign := 1
+	if parts[1][0] == '-' {
+		sign = -1
+	}
+	hours, _ := strconv.Atoi(parts[1][1:3])
+	mins, _ := strconv.Atoi(parts[1][3:5])
+	offset := sign * (hours*3600 + mins*60)
+
+	loc := time.FixedZone(parts[1], offset)
+	return time.Unix(sec, 0).In(loc), nil
 }
 
 type ShellClient struct{}
