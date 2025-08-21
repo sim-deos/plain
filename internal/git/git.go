@@ -20,7 +20,8 @@ import (
 var (
 	Megabyte = 100_000
 
-	ErrNotRepo = errors.New("not a git repository")
+	ErrNotRepo  = errors.New("not a git repository")
+	ErrNotReset = errors.New("must reset")
 )
 
 type BranchGraph struct {
@@ -28,17 +29,17 @@ type BranchGraph struct {
 	Commits map[string]Commit
 }
 
-type HeaderScanner struct {
-	br *bufio.Reader
-}
-
 type Header struct {
 	Kind string
 	Size int64
 }
 
-func NewHeaderScanner() *HeaderScanner {
-	return &HeaderScanner{br: bufio.NewReader(nil)}
+type HeaderScanner struct {
+	br *bufio.Reader
+}
+
+func NewHeaderScanner(r io.Reader) HeaderScanner {
+	return HeaderScanner{br: bufio.NewReader(r)}
 }
 
 func (hs *HeaderScanner) Reset(r io.Reader) {
@@ -46,25 +47,33 @@ func (hs *HeaderScanner) Reset(r io.Reader) {
 }
 
 // Scan parses the header from a git object and returns a reader primed to read the following git objects payload.
+//
+// Scan() can only be called once after either initially creating the HeaderScanner or Resetting it via Reset(). Otherwise,
+// an ErrNoReset err will be returned. This is the case because the HeaderScanner type is meant to read a single git object
+// at a time.
 func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
+	if hs.br.Buffered() > 0 {
+		return Header{}, nil, ErrNotReset
+	}
+
 	kind, err := hs.br.ReadString(' ')
 	if err != nil {
 		return Header{}, nil, err
 	}
-	kind = kind[:len(kind)-1]
+	kind = strings.TrimSuffix(kind, " ")
 
-	sizeBytes, err := hs.br.ReadString('\x00')
+	sizeStr, err := hs.br.ReadString('\x00')
 	if err != nil {
 		return Header{}, nil, err
 	}
-	sizeBytes = sizeBytes[:len(sizeBytes)-1]
+	sizeStr = strings.TrimSuffix(sizeStr, "\x00")
 
-	size, err := strconv.Atoi(sizeBytes)
+	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
 		return Header{}, nil, err
 	}
 
-	return Header{Kind: kind, Size: int64(size)}, &io.LimitedReader{R: hs.br, N: int64(size)}, nil
+	return Header{Kind: kind, Size: size}, io.LimitReader(hs.br, size), nil
 }
 
 // creater a commit, put it in the commitgraph
@@ -137,14 +146,14 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 	}
 
 	branchPath := filepath.Join(gitDir, "refs", "heads", branch)
-	hs, err := os.ReadFile(branchPath)
+	hcs, err := os.ReadFile(branchPath)
 	if err != nil {
 		return BranchGraph{}, fmt.Errorf("failed to retrieve head %w", err)
 	}
 
 	objectsDir := "objects"
 
-	head := string(hs[:len(hs)-1])
+	head := string(hcs[:len(hcs)-1])
 	headPath := filepath.Join(gitDir, objectsDir, head[:2], head[2:])
 
 	cb, err := os.ReadFile(headPath)
@@ -158,21 +167,12 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 		return BranchGraph{}, fmt.Errorf("failed to create decompression reader: %w", err)
 	}
 	rz := zr.(zlib.Resetter)
-	br := bufio.NewReader(zr)
-
-	header, err := br.ReadSlice('\x00')
+	hs := NewHeaderScanner(zr)
+	_, lr, err := hs.Scan()
 	if err != nil {
 		return BranchGraph{}, err
 	}
-	sizeInBytes := header[slices.Index(header, ' ')+1 : len(header)-1]
-
-	size, err := strconv.Atoi(string(sizeInBytes))
-	if err != nil {
-		return BranchGraph{}, err
-	}
-
-	lim := io.LimitedReader{R: br, N: int64(size)}
-	pbr := bufio.NewReader(&lim)
+	pbr := bufio.NewReader(lr)
 
 	headCommit, err := parseCommit(pbr)
 	headCommit.Hash = head
@@ -197,40 +197,18 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 		// reset readers
 		cr.Reset(cb)
 		rz.Reset(cr, nil)
-		br.Reset(zr)
+		hs.Reset(zr)
 
-		bs, _ := io.ReadAll(br)
-		fmt.Println(string(bs))
-
-		// reset readers
-		cr.Reset(cb)
-		rz.Reset(cr, nil)
-		br.Reset(zr)
-
-		kind, err := br.ReadString(' ')
+		header, lr, err := hs.Scan()
 		if err != nil {
 			return BranchGraph{}, err
 		}
-		kind = kind[:len(kind)-1]
 
-		if kind != "commit" {
+		if header.Kind != "commit" {
 			continue
 		}
 
-		sizeBytes, err := br.ReadString('\x00')
-		if err != nil {
-			return BranchGraph{}, err
-		}
-		sizeBytes = sizeBytes[:len(sizeBytes)-1]
-
-		size, err := strconv.Atoi(sizeBytes)
-		if err != nil {
-			return BranchGraph{}, err
-		}
-
-		lim.R = br
-		lim.N = int64(size)
-		pbr.Reset(&lim)
+		pbr.Reset(lr)
 
 		commit, err := parseCommit(pbr)
 		if err != nil {
