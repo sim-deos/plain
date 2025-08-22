@@ -22,26 +22,98 @@ var (
 	ErrNotReset = errors.New("must reset")
 )
 
-type BranchGraph struct {
-	Head    Commit
-	Commits map[string]Commit
+type BranchHistory struct {
+	Head  Commit
+	Graph map[string]Commit
 }
 
+// Returns the commits display name (the first 7 characters in the commits hash)
+func (c Commit) DisName() string {
+	return c.Hash[:7]
+}
+
+type ObjectKind int
+
+const (
+	CommitObject ObjectKind = iota
+	TreeObject
+	BlobObject
+	TagObject
+)
+
 type Header struct {
-	Kind string
+	Kind ObjectKind
 	Size int64
 }
 
-type HeaderScanner struct {
+type ObjectDecoder struct {
+	compReader    io.Reader
+	zlibReader    io.ReadCloser
+	zlibResetter  zlib.Resetter
+	headerReader  *HeaderReader
+	payloadReader *bufio.Reader
+}
+
+func (d *ObjectDecoder) Reset(src io.Reader) error {
+	d.compReader = src
+	err := d.zlibResetter.Reset(d.compReader, nil)
+	if err != nil {
+		return err
+	}
+	d.headerReader.Reset(d.zlibReader)
+	return nil
+}
+
+func (d *ObjectDecoder) Close() error {
+	return d.zlibReader.Close()
+}
+
+func NewObjectDecoder(r io.Reader) (*ObjectDecoder, error) {
+	compReader := r
+	z, err := zlib.NewReader(compReader)
+	if err != nil {
+		return &ObjectDecoder{}, err
+	}
+
+	return &ObjectDecoder{
+		compReader:    compReader,
+		zlibReader:    z,
+		zlibResetter:  z.(zlib.Resetter),
+		headerReader:  NewHeaderScanner(z),
+		payloadReader: bufio.NewReader(nil),
+	}, nil
+}
+
+func (d *ObjectDecoder) Header() (Header, error) {
+	header, payload, err := d.headerReader.Scan()
+	if err != nil {
+		return Header{}, err
+	}
+	d.payloadReader.Reset(payload)
+	return header, nil
+}
+
+func (d *ObjectDecoder) DecodeCommit(hash string) (Commit, error) {
+	if d.payloadReader.Buffered() == 0 {
+		_, payload, err := d.headerReader.Scan()
+		if err != nil {
+			return Commit{}, err
+		}
+		d.payloadReader.Reset(payload)
+	}
+	return parseCommit(hash, d.payloadReader)
+}
+
+type HeaderReader struct {
 	br *bufio.Reader
 }
 
-func NewHeaderScanner(r io.Reader) HeaderScanner {
-	return HeaderScanner{br: bufio.NewReader(r)}
+func NewHeaderScanner(r io.Reader) *HeaderReader {
+	return &HeaderReader{br: bufio.NewReader(r)}
 }
 
-func (hs *HeaderScanner) Reset(r io.Reader) {
-	hs.br.Reset(r)
+func (hr *HeaderReader) Reset(r io.Reader) {
+	hr.br.Reset(r)
 }
 
 // Scan parses the header from a git object and returns a reader primed to read the following git objects payload.
@@ -49,18 +121,29 @@ func (hs *HeaderScanner) Reset(r io.Reader) {
 // Scan() can only be called once after either initially creating the HeaderScanner or Resetting it via Reset(). Otherwise,
 // an ErrNoReset err will be returned. This is the case because the HeaderScanner type is meant to read a single git object
 // at a time.
-func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
-	if hs.br.Buffered() > 0 {
+func (r *HeaderReader) Scan() (Header, io.Reader, error) {
+	if r.br.Buffered() > 0 {
 		return Header{}, nil, ErrNotReset
 	}
 
-	kind, err := hs.br.ReadString(' ')
+	kindStr, err := r.br.ReadString(' ')
 	if err != nil {
 		return Header{}, nil, err
 	}
-	kind = strings.TrimSuffix(kind, " ")
 
-	sizeStr, err := hs.br.ReadString('\x00')
+	var kind ObjectKind
+	switch kindStr {
+	case "commit":
+		kind = CommitObject
+	case "tree":
+		kind = TreeObject
+	case "blob":
+		kind = BlobObject
+	case "tag":
+		kind = TagObject
+	}
+
+	sizeStr, err := r.br.ReadString('\x00')
 	if err != nil {
 		return Header{}, nil, err
 	}
@@ -71,7 +154,7 @@ func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
 		return Header{}, nil, err
 	}
 
-	return Header{Kind: kind, Size: size}, io.LimitReader(hs.br, size), nil
+	return Header{Kind: kind, Size: size}, io.LimitReader(r.br, size), nil
 }
 
 // creater a commit, put it in the commitgraph
@@ -146,52 +229,58 @@ func FindGitDir() (string, error) {
 }
 
 // TODO - this function needs to be refactored later
-func GetHistoryFor(branch string) (BranchGraph, error) {
+func GetHistoryFor(branch string) (BranchHistory, error) {
 	gitDir, err := FindGitDir()
 	if err != nil {
-		return BranchGraph{}, err
+		return BranchHistory{}, err
 	}
 
 	branchPath := filepath.Join(gitDir, "refs", "heads", branch)
 	headBytes, err := os.ReadFile(branchPath)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to retrieve head %w", err)
+		return BranchHistory{}, fmt.Errorf("failed to retrieve head %w", err)
 	}
 
 	headCommitStr := strings.TrimSpace(string(headBytes))
 	objectsPath := filepath.Join(gitDir, "objects")
 	headPath := filepath.Join(objectsPath, headCommitStr[:2], headCommitStr[2:])
 
+	stream, _ := os.Open(headPath)
+	or, err := NewObjectDecoder(stream)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(or.Header())
 	objBytes, err := os.ReadFile(headPath)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to read %s: %w", headPath, err)
+		return BranchHistory{}, fmt.Errorf("failed to read %s: %w", headPath, err)
 	}
 
 	compReader := bytes.NewReader(objBytes)
 	zlibReader, err := zlib.NewReader(compReader)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to create decompression reader: %w", err)
+		return BranchHistory{}, fmt.Errorf("failed to create decompression reader: %w", err)
 	}
 	defer zlibReader.Close()
 	zlibResetter := zlibReader.(zlib.Resetter)
 	headerScanner := NewHeaderScanner(zlibReader)
 	header, payload, err := headerScanner.Scan()
 	if err != nil {
-		return BranchGraph{}, err
+		return BranchHistory{}, err
 	}
 
-	if header.Kind != "commit" {
-		return BranchGraph{}, errors.New("not a commit")
+	if header.Kind != CommitObject {
+		return BranchHistory{}, errors.New("not a commit")
 	}
 
 	payloadReader := bufio.NewReader(payload)
 
 	headCommit, err := parseCommit(headCommitStr, payloadReader)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to parse head: %w", err)
+		return BranchHistory{}, fmt.Errorf("failed to parse head: %w", err)
 	}
 
-	graph := BranchGraph{Head: headCommit, Commits: map[string]Commit{headCommitStr: headCommit}}
+	graph := BranchHistory{Head: headCommit, Graph: map[string]Commit{headCommitStr: headCommit}}
 	stack := slices.Clone(headCommit.Parents)
 
 	for len(stack) > 0 {
@@ -202,7 +291,7 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 
 		objBytes, err = os.ReadFile(commitPath)
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
 		// reset readers
@@ -212,10 +301,10 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 
 		header, lr, err := headerScanner.Scan()
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
-		if header.Kind != "commit" {
+		if header.Kind != CommitObject {
 			continue
 		}
 
@@ -223,12 +312,12 @@ func GetHistoryFor(branch string) (BranchGraph, error) {
 
 		commit, err := parseCommit(currCommitHash, payloadReader)
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
-		graph.Commits[currCommitHash] = commit
+		graph.Graph[currCommitHash] = commit
 		for _, parent := range commit.Parents {
-			if _, ok := graph.Commits[parent]; !ok {
+			if _, ok := graph.Graph[parent]; !ok {
 				stack = append(stack, parent)
 			}
 		}
