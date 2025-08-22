@@ -1,10 +1,103 @@
 package git
 
 import (
+	"bufio"
+	"bytes"
+	"compress/zlib"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
 )
+
+var (
+	ErrNotRepo  = errors.New("not a git repository")
+	ErrNotReset = errors.New("must reset")
+)
+
+type BranchGraph struct {
+	Head    Commit
+	Commits map[string]Commit
+}
+
+type Header struct {
+	Kind string
+	Size int64
+}
+
+type HeaderScanner struct {
+	br *bufio.Reader
+}
+
+func NewHeaderScanner(r io.Reader) HeaderScanner {
+	return HeaderScanner{br: bufio.NewReader(r)}
+}
+
+func (hs *HeaderScanner) Reset(r io.Reader) {
+	hs.br.Reset(r)
+}
+
+// Scan parses the header from a git object and returns a reader primed to read the following git objects payload.
+//
+// Scan() can only be called once after either initially creating the HeaderScanner or Resetting it via Reset(). Otherwise,
+// an ErrNoReset err will be returned. This is the case because the HeaderScanner type is meant to read a single git object
+// at a time.
+func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
+	if hs.br.Buffered() > 0 {
+		return Header{}, nil, ErrNotReset
+	}
+
+	kind, err := hs.br.ReadString(' ')
+	if err != nil {
+		return Header{}, nil, err
+	}
+	kind = strings.TrimSuffix(kind, " ")
+
+	sizeStr, err := hs.br.ReadString('\x00')
+	if err != nil {
+		return Header{}, nil, err
+	}
+	sizeStr = strings.TrimSuffix(sizeStr, "\x00")
+
+	size, err := strconv.ParseInt(sizeStr, 10, 64)
+	if err != nil {
+		return Header{}, nil, err
+	}
+
+	return Header{Kind: kind, Size: size}, io.LimitReader(hs.br, size), nil
+}
+
+// creater a commit, put it in the commitgraph
+type Commit struct {
+	Hash, Tree, Message string
+	Author, Committer   Signature
+	Parents             []string
+}
+
+func (c Commit) IsEnd() bool {
+	return len(c.Parents) == 0
+}
+
+// TODO - Use sb later
+func (commit Commit) String() string {
+	return fmt.Sprintf(
+		"Commit: %s\nTree %s\nAuthor: %s, %s, %s\nCommitter: %s, %s, %s\nMessage: %s",
+		commit.Hash, commit.Tree, commit.Author.Name, commit.Author.Email, commit.Author.Time, commit.Committer.Name, commit.Committer.Email, commit.Committer.Time, commit.Message,
+	)
+}
+
+type Signature struct {
+	Name  string
+	Email string
+	Time  time.Time
+}
 
 type Client interface {
 	Init() error
@@ -16,6 +109,246 @@ type Client interface {
 	CreateBranch(name, from string) error
 	SwitchBranch(name string) error
 }
+
+func FindGitDir() (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+
+	for {
+		git := filepath.Join(cwd, ".git")
+		info, err := os.Stat(git)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				up := filepath.Dir(cwd)
+				if up == cwd {
+					return "", ErrNotRepo
+				}
+				cwd = up
+				continue
+			}
+			return "", err
+		}
+
+		if info.IsDir() {
+			return git, nil
+		}
+
+		fb, err := os.ReadFile(git)
+		if err != nil {
+			return "", err
+		}
+
+		git = strings.TrimSpace(strings.TrimPrefix(string(fb), "gitdir: "))
+		return filepath.Abs(git)
+	}
+}
+
+// TODO - this function needs to be refactored later
+func GetHistoryFor(branch string) (BranchGraph, error) {
+	gitDir, err := FindGitDir()
+	if err != nil {
+		return BranchGraph{}, err
+	}
+
+	branchPath := filepath.Join(gitDir, "refs", "heads", branch)
+	headBytes, err := os.ReadFile(branchPath)
+	if err != nil {
+		return BranchGraph{}, fmt.Errorf("failed to retrieve head %w", err)
+	}
+
+	headCommitStr := strings.TrimSpace(string(headBytes))
+	objectsPath := filepath.Join(gitDir, "objects")
+	headPath := filepath.Join(objectsPath, headCommitStr[:2], headCommitStr[2:])
+
+	objBytes, err := os.ReadFile(headPath)
+	if err != nil {
+		return BranchGraph{}, fmt.Errorf("failed to read %s: %w", headPath, err)
+	}
+
+	compReader := bytes.NewReader(objBytes)
+	zlibReader, err := zlib.NewReader(compReader)
+	if err != nil {
+		return BranchGraph{}, fmt.Errorf("failed to create decompression reader: %w", err)
+	}
+	defer zlibReader.Close()
+	zlibResetter := zlibReader.(zlib.Resetter)
+	headerScanner := NewHeaderScanner(zlibReader)
+	header, payload, err := headerScanner.Scan()
+	if err != nil {
+		return BranchGraph{}, err
+	}
+
+	if header.Kind != "commit" {
+		return BranchGraph{}, errors.New("not a commit")
+	}
+
+	payloadReader := bufio.NewReader(payload)
+
+	headCommit, err := parseCommit(headCommitStr, payloadReader)
+	if err != nil {
+		return BranchGraph{}, fmt.Errorf("failed to parse head: %w", err)
+	}
+
+	graph := BranchGraph{Head: headCommit, Commits: map[string]Commit{headCommitStr: headCommit}}
+	stack := slices.Clone(headCommit.Parents)
+
+	for len(stack) > 0 {
+		currCommitHash := stack[len(stack)-1] // get last element
+		stack = stack[:len(stack)-1]          // remove it (pop)
+
+		commitPath := filepath.Join(objectsPath, currCommitHash[:2], currCommitHash[2:])
+
+		objBytes, err = os.ReadFile(commitPath)
+		if err != nil {
+			return BranchGraph{}, err
+		}
+
+		// reset readers
+		compReader.Reset(objBytes)
+		zlibResetter.Reset(compReader, nil)
+		headerScanner.Reset(zlibReader)
+
+		header, lr, err := headerScanner.Scan()
+		if err != nil {
+			return BranchGraph{}, err
+		}
+
+		if header.Kind != "commit" {
+			continue
+		}
+
+		payloadReader.Reset(lr)
+
+		commit, err := parseCommit(currCommitHash, payloadReader)
+		if err != nil {
+			return BranchGraph{}, err
+		}
+
+		graph.Commits[currCommitHash] = commit
+		for _, parent := range commit.Parents {
+			if _, ok := graph.Commits[parent]; !ok {
+				stack = append(stack, parent)
+			}
+		}
+	}
+
+	return graph, nil
+}
+
+func parseCommit(hash string, br *bufio.Reader) (Commit, error) {
+	commit := Commit{Hash: hash}
+
+	scratch := make([]byte, 0)
+	for {
+		scratch = scratch[:0]
+
+		lineBytes, moreToRead, err := br.ReadLine()
+		if err != nil {
+			return Commit{}, err
+		}
+
+		if moreToRead {
+			scratch = append(scratch, lineBytes...)
+			for moreToRead {
+				moreBytes, stillMore, err := br.ReadLine()
+				if err != nil {
+					return Commit{}, err
+				}
+				scratch = append(scratch, moreBytes...)
+				moreToRead = stillMore
+			}
+			lineBytes = scratch
+		}
+		if len(lineBytes) == 0 {
+			break
+		}
+		assignCommitHeader(lineBytes, &commit)
+	}
+
+	message, err := io.ReadAll(br)
+	if err != nil {
+		return Commit{}, fmt.Errorf("parse: failed to parse commit message for %s. %w", hash, err)
+	}
+	commit.Message = strings.TrimSuffix(string(message), "\n")
+
+	return commit, nil
+}
+
+func assignCommitHeader(line []byte, commit *Commit) error {
+	sepIndex := slices.Index(line, ' ')
+
+	if sepIndex == -1 {
+		return fmt.Errorf("parse: line did not contain canonical separator")
+	}
+
+	header := string(line[:sepIndex])
+	value := line[sepIndex+1:]
+
+	switch header {
+	case "tree":
+		commit.Tree = string(value)
+	case "parent":
+		commit.Parents = append(commit.Parents, string(value))
+	case "author", "committer":
+		emailStartIndex := slices.Index(value, '<')
+		emailEndIndex := slices.Index(value, '>')
+
+		name := string(value[:emailStartIndex-1])
+		email := string(value[emailStartIndex+1 : emailEndIndex])
+		unixTs := string(value[emailEndIndex+1:])
+
+		colloquialTs, err := parseUnixWithOffset(string(unixTs))
+		if err != nil {
+			return fmt.Errorf("parse: failed due to %w", err)
+		}
+
+		sig := Signature{
+			Name:  name,
+			Email: email,
+			Time:  colloquialTs,
+		}
+
+		if header == "author" {
+			commit.Author = sig
+		} else {
+			commit.Committer = sig
+		}
+	}
+
+	return nil
+}
+
+func parseUnixWithOffset(s string) (time.Time, error) {
+	parts := strings.Fields(s)
+	if len(parts) != 2 {
+		return time.Time{}, fmt.Errorf("invalid input format")
+	}
+
+	// Parse the UNIX timestamp
+	sec, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid unix timestamp: %w", err)
+	}
+
+	// Parse the timezone offset (+/-HHMM)
+	if len(parts[1]) != 5 {
+		return time.Time{}, fmt.Errorf("invalid offset format")
+	}
+	sign := 1
+	if parts[1][0] == '-' {
+		sign = -1
+	}
+	hours, _ := strconv.Atoi(parts[1][1:3])
+	mins, _ := strconv.Atoi(parts[1][3:5])
+	offset := sign * (hours*3600 + mins*60)
+
+	loc := time.FixedZone(parts[1], offset)
+	return time.Unix(sec, 0).In(loc), nil
+}
+
+// -------------------- Client Implementations -------------------- //
 
 type ShellClient struct{}
 
