@@ -2,7 +2,6 @@ package git
 
 import (
 	"bufio"
-	"bytes"
 	"compress/zlib"
 	"errors"
 	"fmt"
@@ -22,94 +21,221 @@ var (
 	ErrNotReset = errors.New("must reset")
 )
 
-type BranchGraph struct {
-	Head    Commit
-	Commits map[string]Commit
+// GitObjectKind represents the type of object stored in a Git repository.
+//
+// Git defines four fundamental object kinds: commit, tree, blob, and tag.
+type GitObjectKind int
+
+const (
+	// CommitObject identifies a Git commit object,
+	// which records a snapshot of the repository state.
+	CommitObject GitObjectKind = iota
+
+	// TreeObject identifies a Git tree object,
+	// which represents a directory and its contents.
+	TreeObject
+
+	// BlobObject identifies a Git blob object,
+	// which stores the raw file data.
+	BlobObject
+
+	// TagObject identifies a Git tag object,
+	// which attaches a human-readable name to another object.
+	TagObject
+)
+
+// BranchHistory represents the history of a git branch in a users repository.
+//
+// It holds the head commit and a DAG representation of the rest of the branches history.
+type BranchHistory struct {
+	Head  Commit            // The head of the branch
+	Graph map[string]Commit // A DAG in the form of an adjacecny list to access the rest of the branches history.
 }
 
-type Header struct {
-	Kind string
-	Size int64
+// ObjectHeader represents the header of a git objects file.
+type ObjectHeader struct {
+	Kind GitObjectKind // The kind of git object object is
+	Size int64         // the size of the object in bytes
 }
 
-type HeaderScanner struct {
+// Commit represents a git commit object.
+type Commit struct {
+	Hash      string    // The commit hash belonging to this commit
+	Tree      string    // The tree this commit object is a part of
+	Message   string    // The message given when this commit was comitted
+	Author    Signature // The author of the commit
+	Committer Signature // The committer of this commit
+	Parents   []string  // This commits parents
+}
+
+// Returns the commits display name (the first 7 characters of the commits hash)
+func (c Commit) DisName() string {
+	return c.Hash[:7]
+}
+
+// Returns true if this commit is a leaf (has no parents), otherwise it returns false.
+func (c Commit) IsLeaf() bool {
+	return len(c.Parents) == 0
+}
+
+// Represents the aignature on a commit.
+//
+// Git signatures are made up of the name and email of the committer as well as the time that the commit was committed.
+type Signature struct {
+	Name  string    // The committers name
+	Email string    // The committers email
+	Time  time.Time // The time the commit was committed
+}
+
+// Decoder reads, decompresses, and parses git files to return usable git objects.
+//
+// A new Decoder is created by calling [NewDecoder].
+// The same instance of a Deocder can be used to decode many git objects by resetting the Deocder after each use.
+type Decoder struct {
+	zr io.ReadCloser
 	br *bufio.Reader
 }
 
-func NewHeaderScanner(r io.Reader) HeaderScanner {
-	return HeaderScanner{br: bufio.NewReader(r)}
-}
-
-func (hs *HeaderScanner) Reset(r io.Reader) {
-	hs.br.Reset(r)
-}
-
-// Scan parses the header from a git object and returns a reader primed to read the following git objects payload.
+// Creates a new Decoder.
+// Initialization will fail if the given source is not zlib compressed.
 //
-// Scan() can only be called once after either initially creating the HeaderScanner or Resetting it via Reset(). Otherwise,
-// an ErrNoReset err will be returned. This is the case because the HeaderScanner type is meant to read a single git object
-// at a time.
-func (hs *HeaderScanner) Scan() (Header, io.Reader, error) {
-	if hs.br.Buffered() > 0 {
-		return Header{}, nil, ErrNotReset
+// Be sure to defer closing this instance.
+func NewDecoder(src io.Reader) (*Decoder, error) {
+	z, err := zlib.NewReader(src)
+	if err != nil {
+		return &Decoder{}, err
 	}
 
-	kind, err := hs.br.ReadString(' ')
-	if err != nil {
-		return Header{}, nil, err
-	}
-	kind = strings.TrimSuffix(kind, " ")
+	return &Decoder{
+		zr: z,
+		br: bufio.NewReader(z),
+	}, nil
+}
 
-	sizeStr, err := hs.br.ReadString('\x00')
+// Reset resets all internal state and primes the decoder to start reading from src.
+// Will fail is src is not zlib compressed
+func (d *Decoder) Reset(src io.Reader) error {
+	err := d.zr.(zlib.Resetter).Reset(src, nil)
 	if err != nil {
-		return Header{}, nil, err
+		return err
+	}
+	d.br.Reset(d.zr)
+	return nil
+}
+
+// Closes the Decoder.
+func (d *Decoder) Close() error {
+	return d.zr.Close()
+}
+
+// Reads the header of the current git object.
+// Header contains the objects kind and size in bytes.
+//
+// If the git object itself was already decoded, than this method will fail unless the Decoder is reset.
+func (d *Decoder) Header() (ObjectHeader, error) {
+	if d.br.Buffered() > 0 {
+		return ObjectHeader{}, ErrNotReset
+	}
+
+	kindStr, err := d.br.ReadString(' ')
+	if err != nil {
+		return ObjectHeader{}, err
+	}
+	kindStr = strings.TrimSuffix(kindStr, " ")
+
+	var kind GitObjectKind
+	switch kindStr {
+	case "commit":
+		kind = CommitObject
+	case "tree":
+		kind = TreeObject
+	case "blob":
+		kind = BlobObject
+	case "tag":
+		kind = TagObject
+	}
+
+	sizeStr, err := d.br.ReadString('\x00')
+	if err != nil {
+		return ObjectHeader{}, err
 	}
 	sizeStr = strings.TrimSuffix(sizeStr, "\x00")
 
 	size, err := strconv.ParseInt(sizeStr, 10, 64)
 	if err != nil {
-		return Header{}, nil, err
+		return ObjectHeader{}, err
 	}
 
-	return Header{Kind: kind, Size: size}, io.LimitReader(hs.br, size), nil
+	return ObjectHeader{Kind: kind, Size: size}, nil
 }
 
-// creater a commit, put it in the commitgraph
-type Commit struct {
-	Hash, Tree, Message string
-	Author, Committer   Signature
-	Parents             []string
+// Reads, decodes, and returns the current git object.
+// Once this method is called, Header() will result in an error.
+func (d *Decoder) DecodeCommit(hash string) (Commit, error) {
+	br := d.br
+	commit := Commit{Hash: hash}
+	for {
+		lineBytes, err := br.ReadSlice('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return Commit{}, err
+		}
+		lineBytes = lineBytes[:len(lineBytes)-1]
+
+		if len(lineBytes) == 0 {
+			break
+		}
+
+		sepIndex := slices.Index(lineBytes, ' ')
+		if sepIndex == -1 {
+			return Commit{}, fmt.Errorf("parse: line did not contain canonical separator")
+		}
+
+		header := string(lineBytes[:sepIndex])
+		value := lineBytes[sepIndex+1:]
+		switch header {
+		case "tree":
+			commit.Tree = string(value)
+		case "parent":
+			commit.Parents = append(commit.Parents, string(value))
+		case "author", "committer":
+			emailStartIndex := slices.Index(value, '<')
+			emailEndIndex := slices.Index(value, '>')
+			name := string(value[:emailStartIndex-1])
+			email := string(value[emailStartIndex+1 : emailEndIndex])
+			unixTs := string(value[emailEndIndex+2:])
+
+			colloquialTs, err := parseUnixWithOffset(unixTs)
+			if err != nil {
+				return Commit{}, fmt.Errorf("parse: failed to parse commit due to time error %w", err)
+			}
+
+			sig := Signature{
+				Name:  name,
+				Email: email,
+				Time:  colloquialTs,
+			}
+
+			if header == "author" {
+				commit.Author = sig
+			} else {
+				commit.Committer = sig
+			}
+		}
+	}
+
+	message, err := io.ReadAll(br)
+	if err != nil {
+		return Commit{}, fmt.Errorf("parse: failed to parse commit message for %s. %w", hash, err)
+	}
+	commit.Message = strings.TrimSuffix(string(message), "\n")
+	return commit, nil
 }
 
-func (c Commit) IsEnd() bool {
-	return len(c.Parents) == 0
-}
-
-// TODO - Use sb later
-func (commit Commit) String() string {
-	return fmt.Sprintf(
-		"Commit: %s\nTree %s\nAuthor: %s, %s, %s\nCommitter: %s, %s, %s\nMessage: %s",
-		commit.Hash, commit.Tree, commit.Author.Name, commit.Author.Email, commit.Author.Time, commit.Committer.Name, commit.Committer.Email, commit.Committer.Time, commit.Message,
-	)
-}
-
-type Signature struct {
-	Name  string
-	Email string
-	Time  time.Time
-}
-
-type Client interface {
-	Init() error
-	IsBranchDirty() (bool, error)
-	GetCurrentBranch() (string, error)
-
-	// Create a new branch off of the 'from' branch. If from == 'here', will get the current
-	// branch and base the new branch off of it.
-	CreateBranch(name, from string) error
-	SwitchBranch(name string) error
-}
-
+// Returns a path to the .git directory in this repo.
+// Will return an error of called from outside a git repository.
 func FindGitDir() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -135,189 +261,91 @@ func FindGitDir() (string, error) {
 			return git, nil
 		}
 
+		// If .git is a file
 		fb, err := os.ReadFile(git)
 		if err != nil {
 			return "", err
 		}
-
 		git = strings.TrimSpace(strings.TrimPrefix(string(fb), "gitdir: "))
 		return filepath.Abs(git)
 	}
 }
 
-// TODO - this function needs to be refactored later
-func GetHistoryFor(branch string) (BranchGraph, error) {
+// Get the [BranchHistory] for the given branch.
+func GetHistoryFor(branch string) (BranchHistory, error) {
 	gitDir, err := FindGitDir()
 	if err != nil {
-		return BranchGraph{}, err
+		return BranchHistory{}, err
 	}
 
 	branchPath := filepath.Join(gitDir, "refs", "heads", branch)
 	headBytes, err := os.ReadFile(branchPath)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to retrieve head %w", err)
+		return BranchHistory{}, err
 	}
 
 	headCommitStr := strings.TrimSpace(string(headBytes))
 	objectsPath := filepath.Join(gitDir, "objects")
-	headPath := filepath.Join(objectsPath, headCommitStr[:2], headCommitStr[2:])
+	headCommitPath := filepath.Join(objectsPath, headCommitStr[:2], headCommitStr[2:])
 
-	objBytes, err := os.ReadFile(headPath)
+	objStream, _ := os.Open(headCommitPath)
+	d, err := NewDecoder(objStream)
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to read %s: %w", headPath, err)
+		return BranchHistory{}, fmt.Errorf("git: failed to init object decoder: %w", err)
 	}
+	defer d.Close()
 
-	compReader := bytes.NewReader(objBytes)
-	zlibReader, err := zlib.NewReader(compReader)
+	header, err := d.Header()
 	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to create decompression reader: %w", err)
+		return BranchHistory{}, fmt.Errorf("git: failed to parse header: %w", err)
 	}
-	defer zlibReader.Close()
-	zlibResetter := zlibReader.(zlib.Resetter)
-	headerScanner := NewHeaderScanner(zlibReader)
-	header, payload, err := headerScanner.Scan()
+
+	if header.Kind != CommitObject {
+		return BranchHistory{}, errors.New("start file not a commit")
+	}
+
+	headCommitObj, err := d.DecodeCommit(headCommitStr)
 	if err != nil {
-		return BranchGraph{}, err
+		return BranchHistory{}, fmt.Errorf("failed to parse head: %w", err)
 	}
 
-	if header.Kind != "commit" {
-		return BranchGraph{}, errors.New("not a commit")
-	}
-
-	payloadReader := bufio.NewReader(payload)
-
-	headCommit, err := parseCommit(headCommitStr, payloadReader)
-	if err != nil {
-		return BranchGraph{}, fmt.Errorf("failed to parse head: %w", err)
-	}
-
-	graph := BranchGraph{Head: headCommit, Commits: map[string]Commit{headCommitStr: headCommit}}
-	stack := slices.Clone(headCommit.Parents)
-
+	graph := BranchHistory{Head: headCommitObj, Graph: map[string]Commit{headCommitStr: headCommitObj}}
+	stack := slices.Clone(headCommitObj.Parents)
 	for len(stack) > 0 {
 		currCommitHash := stack[len(stack)-1] // get last element
 		stack = stack[:len(stack)-1]          // remove it (pop)
 
 		commitPath := filepath.Join(objectsPath, currCommitHash[:2], currCommitHash[2:])
 
-		objBytes, err = os.ReadFile(commitPath)
+		objStream, err = os.Open(commitPath)
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
-		// reset readers
-		compReader.Reset(objBytes)
-		zlibResetter.Reset(compReader, nil)
-		headerScanner.Reset(zlibReader)
-
-		header, lr, err := headerScanner.Scan()
+		d.Reset(objStream)
+		header, err := d.Header()
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
-		if header.Kind != "commit" {
+		if header.Kind != CommitObject {
 			continue
 		}
 
-		payloadReader.Reset(lr)
-
-		commit, err := parseCommit(currCommitHash, payloadReader)
+		commit, err := d.DecodeCommit(currCommitHash)
 		if err != nil {
-			return BranchGraph{}, err
+			return BranchHistory{}, err
 		}
 
-		graph.Commits[currCommitHash] = commit
+		graph.Graph[currCommitHash] = commit
 		for _, parent := range commit.Parents {
-			if _, ok := graph.Commits[parent]; !ok {
+			if _, ok := graph.Graph[parent]; !ok {
 				stack = append(stack, parent)
 			}
 		}
 	}
 
 	return graph, nil
-}
-
-func parseCommit(hash string, br *bufio.Reader) (Commit, error) {
-	commit := Commit{Hash: hash}
-
-	scratch := make([]byte, 0)
-	for {
-		scratch = scratch[:0]
-
-		lineBytes, moreToRead, err := br.ReadLine()
-		if err != nil {
-			return Commit{}, err
-		}
-
-		if moreToRead {
-			scratch = append(scratch, lineBytes...)
-			for moreToRead {
-				moreBytes, stillMore, err := br.ReadLine()
-				if err != nil {
-					return Commit{}, err
-				}
-				scratch = append(scratch, moreBytes...)
-				moreToRead = stillMore
-			}
-			lineBytes = scratch
-		}
-		if len(lineBytes) == 0 {
-			break
-		}
-		assignCommitHeader(lineBytes, &commit)
-	}
-
-	message, err := io.ReadAll(br)
-	if err != nil {
-		return Commit{}, fmt.Errorf("parse: failed to parse commit message for %s. %w", hash, err)
-	}
-	commit.Message = strings.TrimSuffix(string(message), "\n")
-
-	return commit, nil
-}
-
-func assignCommitHeader(line []byte, commit *Commit) error {
-	sepIndex := slices.Index(line, ' ')
-
-	if sepIndex == -1 {
-		return fmt.Errorf("parse: line did not contain canonical separator")
-	}
-
-	header := string(line[:sepIndex])
-	value := line[sepIndex+1:]
-
-	switch header {
-	case "tree":
-		commit.Tree = string(value)
-	case "parent":
-		commit.Parents = append(commit.Parents, string(value))
-	case "author", "committer":
-		emailStartIndex := slices.Index(value, '<')
-		emailEndIndex := slices.Index(value, '>')
-
-		name := string(value[:emailStartIndex-1])
-		email := string(value[emailStartIndex+1 : emailEndIndex])
-		unixTs := string(value[emailEndIndex+1:])
-
-		colloquialTs, err := parseUnixWithOffset(string(unixTs))
-		if err != nil {
-			return fmt.Errorf("parse: failed due to %w", err)
-		}
-
-		sig := Signature{
-			Name:  name,
-			Email: email,
-			Time:  colloquialTs,
-		}
-
-		if header == "author" {
-			commit.Author = sig
-		} else {
-			commit.Committer = sig
-		}
-	}
-
-	return nil
 }
 
 func parseUnixWithOffset(s string) (time.Time, error) {
@@ -349,6 +377,17 @@ func parseUnixWithOffset(s string) (time.Time, error) {
 }
 
 // -------------------- Client Implementations -------------------- //
+
+type Client interface {
+	Init() error
+	IsBranchDirty() (bool, error)
+	GetCurrentBranch() (string, error)
+
+	// Create a new branch off of the 'from' branch. If from == 'here', will get the current
+	// branch and base the new branch off of it.
+	CreateBranch(name, from string) error
+	SwitchBranch(name string) error
+}
 
 type ShellClient struct{}
 
