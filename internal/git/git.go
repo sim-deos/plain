@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	ErrNotRepo  = errors.New("not a git repository")
-	ErrNotReset = errors.New("must reset")
+	ErrNotRepo       = errors.New("not a git repository")
+	ErrNotReset      = errors.New("must reset")
+	ErrUnknownObject = errors.New("unknown object kind")
 )
 
 // GitObjectKind represents the type of object stored in a Git repository.
@@ -29,7 +30,7 @@ type GitObjectKind int
 const (
 	// CommitObject identifies a Git commit object,
 	// which records a snapshot of the repository state.
-	CommitObject GitObjectKind = iota
+	CommitObject GitObjectKind = iota + 1
 
 	// TreeObject identifies a Git tree object,
 	// which represents a directory and its contents.
@@ -43,6 +44,17 @@ const (
 	// which attaches a human-readable name to another object.
 	TagObject
 )
+
+var gitObjectName = map[GitObjectKind]string{
+	CommitObject: "commit",
+	TreeObject:   "tree",
+	BlobObject:   "blob",
+	TagObject:    "tag",
+}
+
+func (obj GitObjectKind) String() string {
+	return gitObjectName[obj]
+}
 
 // BranchHistory represents the history of a git branch in a users repository.
 //
@@ -133,6 +145,7 @@ func (d *Decoder) Close() error {
 //
 // If the git object itself was already decoded, than this method will fail unless the Decoder is reset.
 func (d *Decoder) Header() (ObjectHeader, error) {
+	// Check if data has already been read (indicating reset is needed)
 	if d.br.Buffered() > 0 {
 		return ObjectHeader{}, ErrNotReset
 	}
@@ -153,6 +166,8 @@ func (d *Decoder) Header() (ObjectHeader, error) {
 		kind = BlobObject
 	case "tag":
 		kind = TagObject
+	default:
+		return ObjectHeader{}, fmt.Errorf("%w: %q", ErrUnknownObject, kindStr)
 	}
 
 	sizeStr, err := d.br.ReadString('\x00')
