@@ -242,33 +242,36 @@ func FindGitDir() (string, error) {
 		return "", err
 	}
 
+	var gitDir string
+	var info fs.FileInfo
 	for {
-		git := filepath.Join(cwd, ".git")
-		info, err := os.Stat(git)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				up := filepath.Dir(cwd)
-				if up == cwd {
-					return "", ErrNotRepo
-				}
-				cwd = up
-				continue
-			}
+		gitDir = filepath.Join(cwd, ".git")
+		info, err = os.Stat(gitDir)
+
+		if err == nil {
+			break
+		}
+
+		if !errors.Is(err, fs.ErrNotExist) {
 			return "", err
 		}
 
-		if info.IsDir() {
-			return git, nil
+		up := filepath.Dir(cwd)
+		if up == cwd {
+			return "", ErrNotRepo
 		}
-
-		// If .git is a file
-		fb, err := os.ReadFile(git)
-		if err != nil {
-			return "", err
-		}
-		git = strings.TrimSpace(strings.TrimPrefix(string(fb), "gitdir: "))
-		return filepath.Abs(git)
+		cwd = up
 	}
+
+	if !info.IsDir() {
+		fileBytes, err := os.ReadFile(gitDir)
+		if err != nil {
+			return "", err
+		}
+		gitDir = strings.TrimSpace(strings.TrimPrefix(string(fileBytes), "gitdir: "))
+	}
+
+	return filepath.Abs(gitDir)
 }
 
 // Get the [BranchHistory] for the given branch.
