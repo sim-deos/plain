@@ -2,16 +2,15 @@ package git
 
 import (
 	"bufio"
+	"bytes"
 	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -43,6 +42,17 @@ const (
 	// TagObject identifies a Git tag object,
 	// which attaches a human-readable name to another object.
 	TagObject
+)
+
+// Pre-allocated slices to reduce string allocation in object parsing
+var (
+	bCommit    = []byte("commit")
+	bBlob      = []byte("blob")
+	bTag       = []byte("tag")
+	bParent    = []byte("parent")
+	bTree      = []byte("tree")
+	bAuthor    = []byte("author")
+	bCommitter = []byte("committer")
 )
 
 var gitObjectName = map[GitObjectKind]string{
@@ -140,8 +150,8 @@ func (d *Decoder) Close() error {
 	return d.zr.Close()
 }
 
-// Reads the header of the current git object.
-// Header contains the objects kind and size in bytes.
+// Reads the [Header] of the current git object.
+// A header contains the objects kind and size in bytes.
 //
 // If the git object itself was already decoded, than this method will fail unless the Decoder is reset.
 func (d *Decoder) Header() (ObjectHeader, error) {
@@ -150,33 +160,30 @@ func (d *Decoder) Header() (ObjectHeader, error) {
 		return ObjectHeader{}, ErrNotReset
 	}
 
-	kindStr, err := d.br.ReadString(' ')
+	line, err := d.br.ReadSlice('\x00')
 	if err != nil {
 		return ObjectHeader{}, err
 	}
-	kindStr = strings.TrimSuffix(kindStr, " ")
+	line = line[:len(line)-1]
 
 	var kind GitObjectKind
-	switch kindStr {
-	case "commit":
+	switch {
+	case bytes.HasPrefix(line, bCommit):
 		kind = CommitObject
-	case "tree":
+	case bytes.HasPrefix(line, bTree):
 		kind = TreeObject
-	case "blob":
+	case bytes.HasPrefix(line, bBlob):
 		kind = BlobObject
-	case "tag":
+	case bytes.HasPrefix(line, bTag):
 		kind = TagObject
 	default:
-		return ObjectHeader{}, fmt.Errorf("%w: %q", ErrUnknownObject, kindStr)
+		return ObjectHeader{}, fmt.Errorf("%w: %q", ErrUnknownObject, line)
 	}
 
-	sizeStr, err := d.br.ReadString('\x00')
-	if err != nil {
-		return ObjectHeader{}, err
-	}
-	sizeStr = strings.TrimSuffix(sizeStr, "\x00")
+	// commit 262
+	sepIndex := slices.Index(line, ' ')
 
-	size, err := strconv.ParseInt(sizeStr, 10, 64)
+	size, err := bytesToInt64(line[sepIndex+1:])
 	if err != nil {
 		return ObjectHeader{}, err
 	}
@@ -187,10 +194,9 @@ func (d *Decoder) Header() (ObjectHeader, error) {
 // Reads, decodes, and returns the current git object.
 // Once this method is called, Header() will result in an error.
 func (d *Decoder) DecodeCommit(hash string) (Commit, error) {
-	br := d.br
 	commit := Commit{Hash: hash}
 	for {
-		lineBytes, err := br.ReadSlice('\n')
+		lineBytes, err := d.br.ReadSlice('\n')
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -205,24 +211,22 @@ func (d *Decoder) DecodeCommit(hash string) (Commit, error) {
 
 		sepIndex := slices.Index(lineBytes, ' ')
 		if sepIndex == -1 {
-			return Commit{}, fmt.Errorf("parse: line did not contain canonical separator")
+			return Commit{}, fmt.Errorf("parse: line did not contain canonical separator: %s", lineBytes)
 		}
 
-		header := string(lineBytes[:sepIndex])
-		value := lineBytes[sepIndex+1:]
-		switch header {
-		case "tree":
+		header, value := lineBytes[:sepIndex], lineBytes[sepIndex+1:]
+		switch {
+		case bytes.Equal(header, bTree):
 			commit.Tree = string(value)
-		case "parent":
+		case bytes.Equal(header, bParent):
 			commit.Parents = append(commit.Parents, string(value))
-		case "author", "committer":
+		case bytes.Equal(header, bAuthor), bytes.Equal(header, bCommitter):
 			emailStartIndex := slices.Index(value, '<')
 			emailEndIndex := slices.Index(value, '>')
-			name := string(value[:emailStartIndex-1])
-			email := string(value[emailStartIndex+1 : emailEndIndex])
-			unixTs := string(value[emailEndIndex+2:])
 
-			colloquialTs, err := parseUnixWithOffset(unixTs)
+			email := string(value[emailStartIndex+1 : emailEndIndex])
+			name := string(value[:emailStartIndex-1])
+			timestamp, err := parseGitUnixTs(value[emailEndIndex+2:])
 			if err != nil {
 				return Commit{}, fmt.Errorf("parse: failed to parse commit due to time error %w", err)
 			}
@@ -230,10 +234,10 @@ func (d *Decoder) DecodeCommit(hash string) (Commit, error) {
 			sig := Signature{
 				Name:  name,
 				Email: email,
-				Time:  colloquialTs,
+				Time:  timestamp,
 			}
 
-			if header == "author" {
+			if bytes.HasPrefix(header, bAuthor) {
 				commit.Author = sig
 			} else {
 				commit.Committer = sig
@@ -241,7 +245,7 @@ func (d *Decoder) DecodeCommit(hash string) (Commit, error) {
 		}
 	}
 
-	message, err := io.ReadAll(br)
+	message, err := io.ReadAll(d.br)
 	if err != nil {
 		return Commit{}, fmt.Errorf("parse: failed to parse commit message for %s. %w", hash, err)
 	}
@@ -366,112 +370,51 @@ func GetHistoryFor(branch string) (BranchHistory, error) {
 	return graph, nil
 }
 
-func parseUnixWithOffset(s string) (time.Time, error) {
-	parts := strings.Fields(s)
-	if len(parts) != 2 {
-		return time.Time{}, fmt.Errorf("invalid input format")
-	}
+func parseGitUnixTs(timestamp []byte) (time.Time, error) {
+	sepIndex := slices.Index(timestamp, ' ')
 
-	// Parse the UNIX timestamp
-	sec, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid unix timestamp: %w", err)
-	}
-
-	// Parse the timezone offset (+/-HHMM)
-	if len(parts[1]) != 5 {
-		return time.Time{}, fmt.Errorf("invalid offset format")
-	}
-	sign := 1
-	if parts[1][0] == '-' {
+	var sign int
+	if timestamp[sepIndex+1] == '-' {
 		sign = -1
+	} else {
+		sign = 1
 	}
-	hours, _ := strconv.Atoi(parts[1][1:3])
-	mins, _ := strconv.Atoi(parts[1][3:5])
-	offset := sign * (hours*3600 + mins*60)
 
-	loc := time.FixedZone(parts[1], offset)
+	sec, err := bytesToInt64(timestamp[:sepIndex])
+	if err != nil {
+		return time.Time{}, err
+	}
+	hours, err := bytesToInt(timestamp[sepIndex+2 : sepIndex+4])
+	if err != nil {
+		return time.Time{}, err
+	}
+	mins, err := bytesToInt(timestamp[sepIndex+4:])
+	if err != nil {
+		return time.Time{}, err
+	}
+	offset := sign * (hours*3600 + mins*60)
+	loc := time.FixedZone(string(timestamp[sepIndex+1:]), offset)
 	return time.Unix(sec, 0).In(loc), nil
 }
 
-// -------------------- Client Implementations -------------------- //
-
-type Client interface {
-	Init() error
-	IsBranchDirty() (bool, error)
-	GetCurrentBranch() (string, error)
-
-	// Create a new branch off of the 'from' branch. If from == 'here', will get the current
-	// branch and base the new branch off of it.
-	CreateBranch(name, from string) error
-	SwitchBranch(name string) error
-}
-
-type ShellClient struct{}
-
-func NewShellClient() *ShellClient {
-	return &ShellClient{}
-}
-
-func (c *ShellClient) Init() error {
-	gitCmd := exec.Command("git", "init")
-
-	gitCmd.Stdout = os.Stdout
-	gitCmd.Stderr = os.Stderr
-
-	return gitCmd.Run()
-}
-
-func (c *ShellClient) IsBranchDirty() (bool, error) {
-	gitCmd := exec.Command("git", "diff", "--quiet", "--ignore-submodules", "HEAD")
-	_, err := gitCmd.Output()
-	code := err.Error()
-
-	if code == "exit status 1" {
-		return true, nil
-	}
-
-	if code == "exit status 0" {
-		return false, nil
-	}
-
-	return true, err
-}
-
-func (c *ShellClient) GetCurrentBranch() (string, error) {
-	gitBranchCmd := exec.Command("git", "branch", "--show-current")
-
-	output, err := gitBranchCmd.Output()
-	if err != nil {
-		return "", err
-	}
-
-	output = output[:len(output)-1] // trim trailing newline
-
-	return string(output), nil
-}
-
-func (c *ShellClient) CreateBranch(name, from string) error {
-	gitArgs := []string{"checkout", "-b", name}
-
-	if from == "here" {
-		currentBranch, err := c.GetCurrentBranch()
-		if err != nil {
-			return err
+func bytesToInt64(n []byte) (int64, error) {
+	var i int64
+	for _, c := range n {
+		if c < '0' || c > '9' {
+			return -1, fmt.Errorf("unrecognized value in git timestamp (%c) in: %s", c, n)
 		}
-		from = currentBranch
+		i = i*10 + int64(c-'0')
 	}
-
-	gitArgs = append(gitArgs, from)
-
-	gitCmd := exec.Command("git", gitArgs...)
-	gitCmd.Stdout = os.Stdout
-	gitCmd.Stderr = os.Stderr
-
-	return gitCmd.Run()
+	return i, nil
 }
 
-func (c *ShellClient) SwitchBranch(name string) error {
-	fmt.Println("switch not yet implemented")
-	return nil
+func bytesToInt(n []byte) (int, error) {
+	var i int
+	for _, c := range n {
+		if c < '0' || c > '9' {
+			return -1, fmt.Errorf("unrecognized value in git timestamp: %c", c)
+		}
+		i = i*10 + int(c-'0')
+	}
+	return i, nil
 }
