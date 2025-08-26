@@ -81,8 +81,9 @@ func BenchmarkScanner_Reset(b *testing.B) {
 	compressedData := createCompressedBuffer(testCommitObj)
 	compressedBytes := compressedData.Bytes()
 
-	d, _ := NewDecoder(bytes.NewReader(compressedBytes)) // initial, will be Reset()'d
-	for i := 0; i < b.N; i++ {
+	d, _ := NewDecoder(bytes.NewReader(compressedBytes))
+	defer d.Close()
+	for b.Loop() {
 		// Create a new reader with the same data for each iteration
 		// This simulates real-world usage where you'd have different sources
 		d.Reset(bytes.NewReader(compressedBytes))
@@ -100,8 +101,9 @@ func BenchmarkCommitDecoding(b *testing.B) {
 	compressedData := createCompressedBuffer(testCommitObj)
 	compressedBytes := compressedData.Bytes()
 
-	d, _ := NewDecoder(bytes.NewReader(compressedBytes)) // initial, will be Reset()'d
-	for i := 0; i < b.N; i++ {
+	d, _ := NewDecoder(bytes.NewReader(compressedBytes))
+	defer d.Close()
+	for b.Loop() {
 		// Create a new reader with the same data for each iteration
 		d.Reset(bytes.NewReader(compressedBytes))
 
